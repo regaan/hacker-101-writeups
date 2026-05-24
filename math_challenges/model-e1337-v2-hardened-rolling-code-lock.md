@@ -1,0 +1,924 @@
+---
+description: >-
+  64-bit rolling-code RNG cryptanalysis using GF(2) matrix equations to recover
+  state, predict the next code, and unlock the Hacker101 Model E1337 v2
+  challenge.
+---
+
+# Model E1337 v2 - Hardened Rolling Code Lock
+
+## Overview
+
+This challenge is called **Model E1337 v2 — Hardened Rolling Code Lock**.
+
+The website shows a simple unlock form.
+
+It asks for a numeric code:
+
+```
+Code:
+[ submit ]
+```
+
+When I submitted a random wrong code, the app leaked the expected code:
+
+```
+Code incorrect.  Expected 18296348399529277308
+```
+
+The expected code is a **64-bit number**.
+
+The goal is to recover the internal RNG state from one leaked expected code, predict the next valid rolling code, and submit it.
+
+My instance URL was:
+
+```
+https://0159da0ef56bce3857fbd039de4c443b.ctf.hacker101.com/
+```
+
+***
+
+### Initial Recon
+
+I started by checking the website normally.
+
+Submitting any random value to the unlock endpoint gave a response like this:
+
+```
+Code incorrect.  Expected 18296348399529277308
+```
+
+So the application leaks the code it expected.
+
+That is already useful because rolling-code systems are dangerous when future codes are predictable from previous outputs.
+
+Then I checked if the server exposed any source files.
+
+I found the RNG source code at:
+
+```
+/rng
+```
+
+Request:
+
+```bash
+curl https://0159da0ef56bce3857fbd039de4c443b.ctf.hacker101.com/rng
+```
+
+The server returned the random number generator code.
+
+***
+
+### RNG Source Code
+
+The RNG code was:
+
+```python
+import random
+
+def setup(seed):
+    global state
+    state = 0
+    for i in xrange(16):
+        cur = seed & 3
+        seed >>= 2
+        state = (state << 4) | ((state & 3) ^ cur)
+        state |= cur << 2
+
+def next(bits):
+    global state
+
+    ret = 0
+    for i in xrange(bits):
+        ret <<= 1
+        ret |= state & 1
+        for k in xrange(3):
+            state = (state << 1) ^ (state >> 61)
+            state &= 0xFFFFFFFFFFFFFFFF
+            state ^= 0xFFFFFFFFFFFFFFFF
+
+            for j in xrange(0, 64, 4):
+                cur = (state >> j) & 0xF
+                cur = (cur >> 3) | ((cur >> 2) & 2) | ((cur << 3) & 8) | ((cur << 2) & 4)
+                state ^= cur << j
+
+    return ret
+
+setup((random.randrange(0x10000) << 48) | (random.randrange(0x10000) << 32) | (random.randrange(0x10000) << 16) | random.randrange(0x10000))
+```
+
+The important parts are:
+
+```
+1. The internal state is 64-bit.
+2. The output is generated one bit at a time.
+3. Each output bit is the least significant bit of the current state.
+4. After each output bit, the state is updated three times.
+5. The unlock code is generated with next(64).
+```
+
+The output logic is:
+
+```python
+ret <<= 1
+ret |= state & 1
+```
+
+So every output bit gives information about the internal state.
+
+***
+
+### Understanding the Output
+
+The function `next(bits)` builds the returned code bit by bit.
+
+For `next(64)`, it does this 64 times:
+
+```python
+ret <<= 1
+ret |= state & 1
+```
+
+That means the first output bit becomes the most significant bit of the returned 64-bit number.
+
+The state is then advanced three times:
+
+```python
+for k in xrange(3):
+    state = (state << 1) ^ (state >> 61)
+    state &= 0xFFFFFFFFFFFFFFFF
+    state ^= 0xFFFFFFFFFFFFFFFF
+
+    for j in xrange(0, 64, 4):
+        cur = (state >> j) & 0xF
+        cur = (cur >> 3) | ((cur >> 2) & 2) | ((cur << 3) & 8) | ((cur << 2) & 4)
+        state ^= cur << j
+```
+
+So the leaked expected code is the output of:
+
+```python
+next(64)
+```
+
+If I recover the state before that call, I can reproduce the leaked code and then generate the next code.
+
+***
+
+### First Leak
+
+I submitted a wrong code to get one expected value.
+
+Example request:
+
+```bash
+curl -X POST \
+  -d "code=123456789" \
+  https://0159da0ef56bce3857fbd039de4c443b.ctf.hacker101.com/unlock
+```
+
+Example response:
+
+```
+Code incorrect.  Expected 18296348399529277308
+```
+
+In hexadecimal:
+
+```
+18296348399529277308 = 0xfde9afee60bab77c
+```
+
+That value is the current 64-bit output of the RNG.
+
+***
+
+### Main Cryptanalysis Idea
+
+The state transition looks complicated, but it can be modeled with linear algebra over GF(2).
+
+GF(2) means binary arithmetic:
+
+```
+addition = XOR
+multiplication = AND
+```
+
+Every bit of the next state can be represented as a XOR of bits from the current state.
+
+So instead of thinking about the state as one integer, we treat it as a vector of 64 bits.
+
+The transition becomes a `64 x 64` binary matrix.
+
+If the state transition matrix is called `T`, then one inner update is:
+
+```
+new_state = T * old_state
+```
+
+But the RNG updates the state three times after each output bit, so between output bits the transition is:
+
+```
+T^3
+```
+
+The output bit is always the least significant bit of the current state.
+
+So each leaked output bit gives one linear equation.
+
+***
+
+### Why 48 Output Bits Are Enough
+
+The leaked code has 64 bits, but I only need the top 48 bits.
+
+The first output bit generated by the RNG becomes the most significant bit of the leaked number.
+
+So I extract the top 48 bits like this:
+
+```python
+leaked_bits = [(leaked >> (63 - i)) & 1 for i in range(48)]
+```
+
+This gives 48 equations.
+
+I still need 16 more equations to recover a 64-bit state.
+
+Those 16 equations come from a state invariant.
+
+***
+
+### State Invariant
+
+The update function creates a useful invariant in every 4-bit nibble of the state.
+
+For each nibble:
+
+```
+bit0 == bit3
+```
+
+In GF(2), equality can be written as:
+
+```
+bit0 XOR bit3 = 0
+```
+
+A nibble mask that selects bit0 and bit3 is:
+
+```
+1001b = 0x9
+```
+
+So for nibble `i`, the equation is:
+
+```python
+0x9 << (4 * i)
+```
+
+There are 16 nibbles in a 64-bit state, so this gives 16 equations:
+
+```python
+for i in range(16):
+    equations.append(0x9 << (4 * i))
+    rhs.append(0)
+```
+
+Now the system has:
+
+```
+48 equations from leaked output bits
+16 equations from state invariants
+-----------------------------------
+64 equations total
+```
+
+That is enough to solve for the 64-bit internal state.
+
+***
+
+### Building the Transition Matrix
+
+I built the transition matrix automatically.
+
+For every possible input bit position, I created a state with only that bit set:
+
+```python
+1 << j
+```
+
+Then I ran one inner state update.
+
+The output tells me which new state bits depend on that original bit.
+
+```python
+def build_transition_matrix():
+    rows = [0] * 64
+
+    for j in range(64):
+        out = step_inner(1 << j)
+
+        for i in range(64):
+            if (out >> i) & 1:
+                rows[i] |= 1 << j
+
+    return rows
+```
+
+Each row is a 64-bit mask.
+
+A row tells us which old state bits XOR together to produce one new state bit.
+
+***
+
+### Matrix Composition
+
+To move from one output bit to the next output bit, the state is updated three times.
+
+So I need `T^3`.
+
+I used matrix composition:
+
+```python
+T3 = compose(T, compose(T, T))
+```
+
+The matrix rows are stored as bitmasks, so composition is implemented by XORing the needed rows:
+
+```python
+def compose(A, B):
+    C = []
+
+    for row in A:
+        acc = 0
+        x = row
+
+        while x:
+            low = x & -x
+            j = low.bit_length() - 1
+            acc ^= B[j]
+            x ^= low
+
+        C.append(acc)
+
+    return C
+```
+
+***
+
+### Output Equations
+
+At the start, the current state is unknown.
+
+The first output bit is:
+
+```python
+state & 1
+```
+
+That means the first equation is simply the least significant bit of the state.
+
+After that, the state advances by `T^3`.
+
+I repeated this 48 times to generate 48 output equations:
+
+```python
+def build_output_equations(rounds=48):
+    T = build_transition_matrix()
+
+    T3 = compose(T, compose(T, T))
+
+    cur = [1 << i for i in range(64)]
+    equations = []
+
+    for _ in range(rounds):
+        equations.append(cur[0])
+        cur = compose(T3, cur)
+
+    return equations
+```
+
+***
+
+### Solving the System
+
+After collecting the equations, the system looks like this:
+
+```
+A * state = b
+```
+
+where:
+
+```
+A     = 64 binary equations
+state = unknown 64-bit state
+b     = known RHS bits
+```
+
+The first 16 equations are the invariant equations and have RHS 0.
+
+The next 48 equations come from the leaked code bits.
+
+I solved the system using Gaussian elimination over GF(2).
+
+The solver stores each equation as:
+
+```
+64 coefficient bits | 1 RHS bit
+```
+
+Here is the solver:
+
+```python
+def gf2_solve(equations, rhs, n=64):
+    rows = [
+        equations[i] | (rhs[i] << n)
+        for i in range(len(equations))
+    ]
+
+    r = 0
+    pivots = []
+
+    for col in range(n):
+        pivot = None
+
+        for i in range(r, len(rows)):
+            if (rows[i] >> col) & 1:
+                pivot = i
+                break
+
+        if pivot is None:
+            continue
+
+        rows[r], rows[pivot] = rows[pivot], rows[r]
+
+        for i in range(len(rows)):
+            if i != r and ((rows[i] >> col) & 1):
+                rows[i] ^= rows[r]
+
+        pivots.append(col)
+        r += 1
+
+    for row in rows[r:]:
+        coeffs = row & ((1 << n) - 1)
+        val = (row >> n) & 1
+
+        if coeffs == 0 and val:
+            raise ValueError("linear system is inconsistent")
+
+    if r < n:
+        raise ValueError(f"linear system underdetermined, rank={r}")
+
+    x = 0
+
+    for row, col in zip(rows[:r], pivots):
+        if (row >> n) & 1:
+            x |= 1 << col
+
+    return x
+```
+
+***
+
+### Verifying the Recovered State
+
+After solving, I got a candidate internal state.
+
+I verified it by running:
+
+```python
+reproduced, state_after_leak = rng_next(state, 64)
+```
+
+If the recovered state is correct, it should reproduce the leaked expected code.
+
+In my successful run:
+
+```
+[+] Leaked expected code: 18296348399529277308
+[+] Leaked expected hex:  0xfde9afee60bab77c
+[+] Recovered state: 0x0b9b4044496b249d
+[+] Reproduced leaked code: 18296348399529277308
+[+] Reproduced hex:         0xfde9afee60bab77c
+[+] Leak verified.
+```
+
+Since the reproduced code matched the leaked code, the state was correct.
+
+Then I generated the next code:
+
+```python
+next_code, _ = rng_next(state_after_leak, 64)
+```
+
+The predicted next code was:
+
+```
+11586704901211155567
+```
+
+Hex:
+
+```
+0xa0cc3eb7f9f7ec6f
+```
+
+Submitting that code unlocked the challenge.
+
+***
+
+### Full Exploit Script
+
+```python
+#!/usr/bin/env python3
+import re
+import sys
+import requests
+
+MASK = 0xFFFFFFFFFFFFFFFF
+
+DEFAULT_URL = "https://0159da0ef56bce3857fbd039de4c443b.ctf.hacker101.com"
+
+
+def step_inner(state):
+    state = ((state << 1) ^ (state >> 61)) & MASK
+    state ^= MASK
+
+    for j in range(0, 64, 4):
+        cur = (state >> j) & 0xF
+        cur = (
+            (cur >> 3)
+            | ((cur >> 2) & 2)
+            | ((cur << 3) & 8)
+            | ((cur << 2) & 4)
+        )
+        state ^= cur << j
+
+    return state & MASK
+
+
+def rng_next(state, bits=64):
+    ret = 0
+
+    for _ in range(bits):
+        ret <<= 1
+        ret |= state & 1
+
+        for _ in range(3):
+            state = step_inner(state)
+
+    return ret, state
+
+
+def build_transition_matrix():
+    rows = [0] * 64
+
+    for j in range(64):
+        out = step_inner(1 << j)
+
+        for i in range(64):
+            if (out >> i) & 1:
+                rows[i] |= 1 << j
+
+    return rows
+
+
+def compose(A, B):
+    C = []
+
+    for row in A:
+        acc = 0
+        x = row
+
+        while x:
+            low = x & -x
+            j = low.bit_length() - 1
+            acc ^= B[j]
+            x ^= low
+
+        C.append(acc)
+
+    return C
+
+
+def build_output_equations(rounds=48):
+    T = build_transition_matrix()
+
+    T3 = compose(T, compose(T, T))
+
+    cur = [1 << i for i in range(64)]
+    equations = []
+
+    for _ in range(rounds):
+        equations.append(cur[0])
+        cur = compose(T3, cur)
+
+    return equations
+
+
+def build_live_state_constraints():
+    return [0x9 << (4 * i) for i in range(16)]
+
+
+def gf2_solve(equations, rhs, n=64):
+    rows = [
+        equations[i] | (rhs[i] << n)
+        for i in range(len(equations))
+    ]
+
+    r = 0
+    pivots = []
+
+    for col in range(n):
+        pivot = None
+
+        for i in range(r, len(rows)):
+            if (rows[i] >> col) & 1:
+                pivot = i
+                break
+
+        if pivot is None:
+            continue
+
+        rows[r], rows[pivot] = rows[pivot], rows[r]
+
+        for i in range(len(rows)):
+            if i != r and ((rows[i] >> col) & 1):
+                rows[i] ^= rows[r]
+
+        pivots.append(col)
+        r += 1
+
+    for row in rows[r:]:
+        coeffs = row & ((1 << n) - 1)
+        val = (row >> n) & 1
+
+        if coeffs == 0 and val:
+            raise ValueError("linear system is inconsistent")
+
+    if r < n:
+        raise ValueError(f"linear system underdetermined, rank={r}")
+
+    x = 0
+
+    for row, col in zip(rows[:r], pivots):
+        if (row >> n) & 1:
+            x |= 1 << col
+
+    return x
+
+
+def extract_expected_code(text):
+    m = re.search(r"Expected\s+(\d+)", text)
+
+    if m:
+        return int(m.group(1))
+
+    candidates = []
+
+    for item in re.findall(r"\b\d{10,20}\b", text):
+        value = int(item)
+
+        if 0 <= value <= MASK:
+            candidates.append(value)
+
+    if not candidates:
+        print("[!] Could not find expected code in response:")
+        print(text)
+        raise ValueError("no leaked expected code found")
+
+    return candidates[-1]
+
+
+def get_leak(session, url):
+    print("[+] Requesting wrong-code page...")
+
+    r = session.post(f"{url}/unlock", data={"code": "123456789"}, timeout=20)
+    r.raise_for_status()
+
+    print()
+    print("========== SERVER RESPONSE ==========")
+    print(r.text)
+    print("======== END SERVER RESPONSE ========")
+    print()
+
+    leaked = extract_expected_code(r.text)
+
+    print(f"[+] Leaked expected code: {leaked}")
+    print(f"[+] Leaked expected hex:  0x{leaked:016x}")
+
+    return leaked
+
+
+def recover_state(leaked):
+    live_constraints = build_live_state_constraints()
+    output_equations = build_output_equations(rounds=48)
+
+    equations = []
+    rhs = []
+
+    for eq in live_constraints:
+        equations.append(eq)
+        rhs.append(0)
+
+    for i, eq in enumerate(output_equations):
+        equations.append(eq)
+        rhs.append((leaked >> (63 - i)) & 1)
+
+    return gf2_solve(equations, rhs)
+
+
+def main():
+    url = DEFAULT_URL
+
+    if len(sys.argv) >= 2:
+        url = sys.argv[1]
+
+    url = url.rstrip("/")
+
+    session = requests.Session()
+
+    leaked = get_leak(session, url)
+
+    print("[+] Recovering current RNG state...")
+    state = recover_state(leaked)
+
+    print(f"[+] Recovered state: 0x{state:016x}")
+
+    reproduced, state_after_leak = rng_next(state, 64)
+
+    print(f"[+] Reproduced leaked code: {reproduced}")
+    print(f"[+] Reproduced hex:         0x{reproduced:016x}")
+
+    if reproduced != leaked:
+        print("[!] Full 64-bit leak did not reproduce exactly.")
+        print("[!] But top 48 should match.")
+
+        if (reproduced >> 16) != (leaked >> 16):
+            print("[!] Top 48 bits do not match either. Something is wrong.")
+            return
+
+    print("[+] Leak verified.")
+
+    next_code, _ = rng_next(state_after_leak, 64)
+
+    print(f"[+] Predicted next code: {next_code}")
+    print(f"[+] Predicted hex:       0x{next_code:016x}")
+    print("[+] Submitting predicted code...")
+
+    r = session.post(f"{url}/unlock", data={"code": str(next_code)}, timeout=20)
+    r.raise_for_status()
+
+    print()
+    print(r.text)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+***
+
+### Running the Exploit
+
+I saved the script as:
+
+```
+e1337_final.py
+```
+
+Then I ran it:
+
+```bash
+python3 e1337_final.py https://0159da0ef56bce3857fbd039de4c443b.ctf.hacker101.com
+```
+
+Output:
+
+```
+[+] Requesting wrong-code page...
+
+========== SERVER RESPONSE ==========
+Code incorrect.  Expected 18296348399529277308
+======== END SERVER RESPONSE ========
+
+[+] Leaked expected code: 18296348399529277308
+[+] Leaked expected hex:  0xfde9afee60bab77c
+[+] Recovering current RNG state...
+[+] Recovered state: 0x0b9b4044496b249d
+[+] Reproduced leaked code: 18296348399529277308
+[+] Reproduced hex:         0xfde9afee60bab77c
+[+] Leak verified.
+[+] Predicted next code: 11586704901211155567
+[+] Predicted hex:       0xa0cc3eb7f9f7ec6f
+[+] Submitting predicted code...
+
+Unlocked successfully.  Flag: ^FLAG^cd7f3bf3c551bc7ad4f8734c6423e0b830bcedcf5651804f09ebdbf7a2ca2a89$FLAG$
+```
+
+***
+
+### Final Flag
+
+```
+^FLAG^cd7f3bf3c551bc7ad4f8734c6423e0b830bcedcf5651804f09ebdbf7a2ca2a89$FLAG$
+```
+
+***
+
+### Why This Worked
+
+The RNG looked hardened because:
+
+```
+1. The code is 64-bit.
+2. The internal state is 64-bit.
+3. The state update happens three times per output bit.
+4. The update function looks complicated.
+```
+
+But the transition still behaves linearly over GF(2).
+
+That means the state can be recovered with linear algebra.
+
+The leaked expected code gives output bits.
+
+The state invariant gives the missing equations.
+
+Together:
+
+```
+48 leaked output equations
+16 state invariant equations
+---------------------------
+64 equations
+```
+
+Solving those equations gives the full internal state.
+
+Once the state is known, the rolling code is no longer unpredictable.
+
+I can reproduce the leaked code and then compute the next code.
+
+***
+
+### Fix
+
+The issue is that the unlock code is generated using a predictable custom RNG.
+
+A secure fix would be:
+
+```
+1. Do not expose expected codes in error messages.
+2. Do not use a custom linear RNG for security-sensitive codes.
+3. Use a cryptographically secure random generator.
+4. Use server-side one-time tokens with expiration.
+5. Rate limit unlock attempts.
+6. Avoid leaking RNG source code from production routes.
+```
+
+In Python, secure random values should come from `secrets`, not a custom PRNG:
+
+```python
+import secrets
+
+code = secrets.randbits(64)
+```
+
+Error messages should be generic:
+
+```
+Code incorrect.
+```
+
+not:
+
+```
+Code incorrect. Expected 18296348399529277308
+```
+
+***
+
+### Summary
+
+The solve path was:
+
+```
+1. Found the /rng source code.
+2. Saw that next(64) leaks 64 output bits.
+3. Submitted a wrong code to leak one expected value.
+4. Modeled the RNG transition as a GF(2) matrix.
+5. Built equations for the top 48 leaked output bits.
+6. Added 16 nibble invariant equations.
+7. Solved the 64-equation system with Gaussian elimination.
+8. Recovered the internal RNG state.
+9. Reproduced the leaked code to verify the state.
+10. Generated the next code.
+11. Submitted the predicted code and unlocked the flag.
+```
+
+The key idea was that a complicated-looking RNG is not automatically secure.
+
+If the state transition is linear and enough output bits leak, the internal state can be recovered.

